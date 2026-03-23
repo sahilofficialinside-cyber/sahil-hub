@@ -1,0 +1,262 @@
+// ============================================================
+// controllers/orderController.js — Place and manage orders
+// ============================================================
+const mongoose = require('mongoose');
+const Order = require('../models/Order');
+const User = require('../models/User');
+const CoinTransaction = require('../models/CoinTransaction');
+const { asyncHandler } = require('../middleware/errorHandler');
+
+// Pricing constants
+const COINS_PER_30_VOTES = 20;
+const COINS_PER_30_REACTS = 15;
+
+// Valid vote options
+const VALID_VOTE_OPTIONS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+const VALID_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+// WhatsApp channel link regex
+const WA_CHANNEL_REGEX = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/[A-Za-z0-9_\-]+/i;
+
+// Calculate coin cost for an order
+const calculateCost = (type, quantity) => {
+  const ratePerUnit = type === 'vote'
+    ? COINS_PER_30_VOTES / 30
+    : COINS_PER_30_REACTS / 30;
+  return Math.ceil(quantity * ratePerUnit);
+};
+
+// ── POST /api/orders ──────────────────────────────────────────
+const placeOrder = asyncHandler(async (req, res) => {
+  const { link, type, option, quantity } = req.body;
+
+  // ── Validate inputs ──────────────────────────────────────
+  if (!link || !type || !option || !quantity) {
+    return res.status(400).json({ success: false, message: 'All fields are required.' });
+  }
+
+  // Validate link
+  if (!WA_CHANNEL_REGEX.test(link.trim())) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid link. Only WhatsApp Channel post links are accepted.',
+    });
+  }
+
+  // Validate type
+  if (!['vote', 'react'].includes(type)) {
+    return res.status(400).json({ success: false, message: 'Invalid type. Must be vote or react.' });
+  }
+
+  // Validate option based on type
+  if (type === 'vote' && !VALID_VOTE_OPTIONS.includes(option)) {
+    return res.status(400).json({ success: false, message: 'Invalid vote option. Choose A-H.' });
+  }
+  if (type === 'react' && !VALID_EMOJIS.includes(option)) {
+    return res.status(400).json({ success: false, message: 'Invalid emoji reaction.' });
+  }
+
+  // Validate quantity
+  const qty = parseInt(quantity, 10);
+  if (!Number.isInteger(qty) || qty < 30) {
+    return res.status(400).json({ success: false, message: 'Minimum quantity is 30.' });
+  }
+  if (qty > 100000) {
+    return res.status(400).json({ success: false, message: 'Maximum quantity is 100,000.' });
+  }
+
+  // ── Check coins (atomic using session) ───────────────────
+  const coinsRequired = calculateCost(type, qty);
+
+  // Use a MongoDB session for atomicity
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    // Lock the user document for this transaction
+    const user = await User.findById(req.user._id).session(session);
+
+    if (!user) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    if (user.coins < coinsRequired) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient coins. You need ${coinsRequired} coins but have ${user.coins}.`,
+        coinsRequired,
+        coinsAvailable: user.coins,
+        shortfall: coinsRequired - user.coins,
+      });
+    }
+
+    // Deduct coins
+    user.coins -= coinsRequired;
+    user.totalCoinsSpent += coinsRequired;
+    await user.save({ session });
+
+    // Create order
+    const order = new Order({
+      user: user._id,
+      username: user.username,
+      link: link.trim(),
+      type,
+      option,
+      quantity: qty,
+      coinsDeducted: coinsRequired,
+      status: 'pending',
+      ipAddress: req.ip || '',
+    });
+    await order.save({ session });
+
+    // Record coin transaction
+    await CoinTransaction.create(
+      [{
+        user: user._id,
+        username: user.username,
+        type: 'debit',
+        amount: coinsRequired,
+        balanceAfter: user.coins,
+        reason: 'order',
+        orderId: order.orderId,
+        performedBy: 'system',
+        note: `Order ${order.orderId}: ${qty} ${type}s (${option})`,
+      }],
+      { session }
+    );
+
+    await session.commitTransaction();
+
+    // ── Simulate async processing ─────────────────────────
+    // In production: push to a job queue (Bull, BullMQ, etc.)
+    simulateOrderProcessing(order._id);
+
+    res.status(201).json({
+      success: true,
+      message: `Order placed! ${coinsRequired} coins deducted. 🎉`,
+      order: {
+        orderId: order.orderId,
+        type: order.type,
+        option: order.option,
+        quantity: order.quantity,
+        coinsDeducted: order.coinsDeducted,
+        status: order.status,
+        createdAt: order.createdAt,
+      },
+      newCoinBalance: user.coins,
+    });
+
+  } catch (error) {
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
+  }
+});
+
+// Simulate async order processing (replace with real queue in production)
+const simulateOrderProcessing = async (orderId) => {
+  try {
+    // Mark as processing after 3 seconds
+    setTimeout(async () => {
+      await Order.findByIdAndUpdate(orderId, {
+        status: 'processing',
+        processingStartedAt: new Date(),
+      });
+    }, 3000);
+
+    // Mark as completed after random 10-30 seconds
+    const delay = 10000 + Math.random() * 20000;
+    setTimeout(async () => {
+      await Order.findByIdAndUpdate(orderId, {
+        status: 'completed',
+        completedAt: new Date(),
+      });
+    }, delay);
+  } catch (err) {
+    console.error('Processing simulation error:', err);
+  }
+};
+
+// ── GET /api/orders — User's own orders ──────────────────────
+const getMyOrders = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const skip = (page - 1) * limit;
+
+  const [orders, total] = await Promise.all([
+    Order.find({ user: req.user._id })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select('-user -ipAddress'),
+    Order.countDocuments({ user: req.user._id }),
+  ]);
+
+  res.json({
+    success: true,
+    orders,
+    pagination: {
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+      limit,
+    },
+  });
+});
+
+// ── GET /api/orders/:orderId — Get single order ───────────────
+const getOrder = asyncHandler(async (req, res) => {
+  const order = await Order.findOne({
+    orderId: req.params.orderId,
+    user: req.user._id,
+  }).select('-user -ipAddress');
+
+  if (!order) {
+    return res.status(404).json({ success: false, message: 'Order not found.' });
+  }
+
+  res.json({ success: true, order });
+});
+
+// ── GET /api/orders/stats — User order statistics ────────────
+const getMyStats = asyncHandler(async (req, res) => {
+  const userId = req.user._id;
+
+  const [total, byStatus, byType, user] = await Promise.all([
+    Order.countDocuments({ user: userId }),
+    Order.aggregate([
+      { $match: { user: new mongoose.Types.ObjectId(userId) } },
+      { $group: { _id: '$status', count: { $sum: 1 } } },
+    ]),
+    Order.aggregate([
+      { $match: { user: new mongoose.Types.ObjectId(userId) } },
+      { $group: { _id: '$type', count: { $sum: 1 }, totalQty: { $sum: '$quantity' } } },
+    ]),
+    User.findById(userId).select('coins totalCoinsSpent totalCoinsPurchased'),
+  ]);
+
+  const statusMap = {};
+  byStatus.forEach((s) => (statusMap[s._id] = s.count));
+
+  res.json({
+    success: true,
+    stats: {
+      totalOrders: total,
+      pending: statusMap.pending || 0,
+      processing: statusMap.processing || 0,
+      completed: statusMap.completed || 0,
+      failed: statusMap.failed || 0,
+      coins: user.coins,
+      totalCoinsSpent: user.totalCoinsSpent,
+      totalCoinsPurchased: user.totalCoinsPurchased,
+      byType,
+    },
+  });
+});
+
+// Export coin cost calculator for use in routes
+module.exports = { placeOrder, getMyOrders, getOrder, getMyStats, calculateCost };
