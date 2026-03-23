@@ -1,0 +1,67 @@
+// ============================================================
+// models/CoinTransaction.js — Full audit trail for all coin movements
+// ============================================================
+const mongoose = require('mongoose');
+
+const coinTransactionSchema = new mongoose.Schema(
+  {
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+
+    username: { type: String, required: true },
+
+    // credit = coins added, debit = coins removed
+    type: {
+      type: String,
+      enum: ['credit', 'debit'],
+      required: true,
+    },
+
+    amount: {
+      type: Number,
+      required: true,
+      min: 1,
+    },
+
+    // Balance after this transaction
+    balanceAfter: {
+      type: Number,
+      required: true,
+    },
+
+    // Reason for transaction
+    reason: {
+      type: String,
+      enum: ['order', 'purchase', 'admin_add', 'admin_remove', 'refund', 'bonus'],
+      required: true,
+    },
+
+    // Reference to order if applicable
+    orderId: {
+      type: String,
+      default: null,
+    },
+
+    // Admin who performed the action (if applicable)
+    performedBy: {
+      type: String,
+      default: 'system',
+    },
+
+    note: {
+      type: String,
+      default: '',
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+coinTransactionSchema.index({ user: 1, createdAt: -1 });
+coinTransactionSchema.index({ createdAt: -1 });
+
+module.exports = mongoose.model('CoinTransaction', coinTransactionSchema);
