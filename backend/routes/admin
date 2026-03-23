@@ -1,0 +1,35 @@
+// ============================================================
+// routes/admin.js
+// ============================================================
+const express = require('express');
+const router = express.Router();
+const {
+  getDashboard, getUsers, getUserDetail,
+  manageCoins, getOrders, updateOrderStatus,
+  toggleBan, exportOrders, exportUsers,
+} = require('../controllers/adminController');
+const { protect, adminOnly } = require('../middleware/auth');
+
+// All admin routes require auth + admin role
+router.use(protect, adminOnly);
+
+// Dashboard
+router.get('/dashboard', getDashboard);
+
+// User management
+router.get('/users', getUsers);
+router.get('/users/:id', getUserDetail);
+router.patch('/users/:id/ban', toggleBan);
+
+// Coin management
+router.post('/coins', manageCoins);
+
+// Order management
+router.get('/orders', getOrders);
+router.patch('/orders/:orderId/status', updateOrderStatus);
+
+// CSV export
+router.get('/export/orders', exportOrders);
+router.get('/export/users', exportUsers);
+
+module.exports = router;
