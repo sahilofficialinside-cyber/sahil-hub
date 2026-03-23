@@ -1,0 +1,184 @@
+// ============================================================
+// controllers/authController.js — Register, Login, Profile
+// ============================================================
+const bcrypt = require('bcryptjs');
+const User = require('../models/User');
+const CoinTransaction = require('../models/CoinTransaction');
+const { generateToken } = require('../middleware/auth');
+const { asyncHandler } = require('../middleware/errorHandler');
+
+// ── POST /api/auth/register ──────────────────────────────────
+const register = asyncHandler(async (req, res) => {
+  const { name, username, whatsapp, password } = req.body;
+
+  // Input validation
+  if (!name || !username || !whatsapp || !password) {
+    return res.status(400).json({ success: false, message: 'All fields are required.' });
+  }
+  if (username.length > 12) {
+    return res.status(400).json({ success: false, message: 'Username max 12 characters.' });
+  }
+  if (password.length > 10) {
+    return res.status(400).json({ success: false, message: 'Password max 10 characters.' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+  }
+  if (!/^[a-z0-9_]+$/i.test(username)) {
+    return res.status(400).json({ success: false, message: 'Username: letters, numbers, underscores only.' });
+  }
+
+  // Check username availability
+  const existingUser = await User.findOne({ username: username.toLowerCase() });
+  if (existingUser) {
+    return res.status(400).json({ success: false, message: 'Username already taken.' });
+  }
+
+  // Hash password (cost 12 = strong)
+  const hashedPassword = await bcrypt.hash(password, 12);
+
+  // Create user
+  const user = await User.create({
+    name: name.trim(),
+    username: username.toLowerCase().trim(),
+    whatsapp: whatsapp.trim(),
+    password: hashedPassword,
+    coins: 0,
+  });
+
+  const token = generateToken(user._id);
+
+  res.status(201).json({
+    success: true,
+    message: `Welcome to Sahil Hub, ${user.name}! 🎉`,
+    token,
+    user: {
+      id: user._id,
+      name: user.name,
+      username: user.username,
+      whatsapp: user.whatsapp,
+      coins: user.coins,
+      isAdmin: user.isAdmin,
+      createdAt: user.createdAt,
+    },
+  });
+});
+
+// ── POST /api/auth/login ─────────────────────────────────────
+const login = asyncHandler(async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ success: false, message: 'Username and password required.' });
+  }
+
+  // Include password field explicitly (it's hidden by default)
+  const user = await User.findOne({ username: username.toLowerCase() }).select('+password');
+
+  if (!user) {
+    return res.status(401).json({ success: false, message: 'Invalid username or password.' });
+  }
+
+  if (user.isBanned) {
+    return res.status(403).json({ success: false, message: 'Account suspended. Contact support.' });
+  }
+
+  // Check if account is locked from too many attempts
+  if (user.isLocked) {
+    return res.status(423).json({
+      success: false,
+      message: 'Account temporarily locked. Try again later.',
+    });
+  }
+
+  const passwordMatch = await bcrypt.compare(password, user.password);
+
+  if (!passwordMatch) {
+    // Increment login attempts
+    user.loginAttempts = (user.loginAttempts || 0) + 1;
+    if (user.loginAttempts >= 5) {
+      user.lockUntil = new Date(Date.now() + 30 * 60 * 1000); // Lock 30 min
+    }
+    await user.save({ validateBeforeSave: false });
+
+    return res.status(401).json({ success: false, message: 'Invalid username or password.' });
+  }
+
+  // Reset login attempts on success
+  user.loginAttempts = 0;
+  user.lockUntil = undefined;
+  user.lastLoginAt = new Date();
+  await user.save({ validateBeforeSave: false });
+
+  const token = generateToken(user._id);
+
+  res.json({
+    success: true,
+    message: `Welcome back, ${user.name}! 👋`,
+    token,
+    user: {
+      id: user._id,
+      name: user.name,
+      username: user.username,
+      whatsapp: user.whatsapp,
+      coins: user.coins,
+      isAdmin: user.isAdmin,
+      lastLoginAt: user.lastLoginAt,
+    },
+  });
+});
+
+// ── GET /api/auth/me ─────────────────────────────────────────
+const getMe = asyncHandler(async (req, res) => {
+  // req.user is set by protect middleware (always fresh from DB)
+  const user = await User.findById(req.user._id);
+
+  res.json({
+    success: true,
+    user: {
+      id: user._id,
+      name: user.name,
+      username: user.username,
+      whatsapp: user.whatsapp,
+      coins: user.coins,
+      totalCoinsPurchased: user.totalCoinsPurchased,
+      totalCoinsSpent: user.totalCoinsSpent,
+      isAdmin: user.isAdmin,
+      createdAt: user.createdAt,
+      lastLoginAt: user.lastLoginAt,
+    },
+  });
+});
+
+// ── GET /api/auth/check-username?username=xxx ────────────────
+const checkUsername = asyncHandler(async (req, res) => {
+  const { username } = req.query;
+
+  if (!username || username.length < 3) {
+    return res.json({ success: true, available: false, message: 'Too short.' });
+  }
+  if (username.length > 12) {
+    return res.json({ success: true, available: false, message: 'Max 12 characters.' });
+  }
+  if (!/^[a-z0-9_]+$/i.test(username)) {
+    return res.json({ success: true, available: false, message: 'Invalid characters.' });
+  }
+
+  const exists = await User.findOne({ username: username.toLowerCase() });
+  res.json({
+    success: true,
+    available: !exists,
+    message: exists ? 'Username already taken.' : 'Username available!',
+  });
+});
+
+// ── GET /api/auth/coin-history ───────────────────────────────
+const getCoinHistory = asyncHandler(async (req, res) => {
+  const transactions = await CoinTransaction.find({ user: req.user._id })
+    .sort({ createdAt: -1 })
+    .limit(20);
+
+  res.json({ success: true, transactions });
+});
+
+module.exports = { register, login, getMe, checkUsername, getCoinHistory };
