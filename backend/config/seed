@@ -1,0 +1,47 @@
+// ============================================================
+// config/seed.js — Seeds the admin user into the database
+// Run once with: node config/seed.js
+// ============================================================
+require('dotenv').config();
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const connectDB = require('./db');
+
+const seedAdmin = async () => {
+  await connectDB();
+
+  const User = require('../models/User');
+
+  // Check if admin already exists
+  const existing = await User.findOne({ isAdmin: true });
+  if (existing) {
+    console.log('✅ Admin already exists:', existing.username);
+    process.exit(0);
+  }
+
+  const hashedPassword = await bcrypt.hash(
+    process.env.ADMIN_PASSWORD || 'Admin@Sahil2024!',
+    12
+  );
+
+  const admin = new User({
+    name: process.env.ADMIN_NAME || 'Sahil Admin',
+    username: process.env.ADMIN_USERNAME || 'sahil_admin',
+    whatsapp: '+923496049312',
+    password: hashedPassword,
+    coins: 999999,
+    isAdmin: true,
+    isVerified: true,
+  });
+
+  await admin.save();
+  console.log('✅ Admin user created successfully!');
+  console.log('   Username:', admin.username);
+  console.log('   Password:', process.env.ADMIN_PASSWORD || 'Admin@Sahil2024!');
+  process.exit(0);
+};
+
+seedAdmin().catch((err) => {
+  console.error('❌ Seed failed:', err);
+  process.exit(1);
+});
