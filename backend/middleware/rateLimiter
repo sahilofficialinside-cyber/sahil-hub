@@ -1,0 +1,55 @@
+// ============================================================
+// middleware/rateLimiter.js — Rate limiting to prevent abuse
+// ============================================================
+const rateLimit = require('express-rate-limit');
+
+// General API rate limiter
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests. Please wait 15 minutes before trying again.',
+  },
+  skip: (req) => {
+    // Skip rate limiting for admin routes if needed
+    return false;
+  },
+});
+
+// Strict limiter for auth endpoints (prevent brute force)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // Only 10 auth attempts per 15 min
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many login attempts. Please wait 15 minutes.',
+  },
+});
+
+// Order placement limiter
+const orderLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5, // Max 5 orders per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many orders placed. Please slow down.',
+  },
+});
+
+// Username check limiter (prevent username enumeration)
+const userCheckLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests.' },
+});
+
+module.exports = { apiLimiter, authLimiter, orderLimiter, userCheckLimiter };
