@@ -1,0 +1,19 @@
+// ============================================================
+// routes/auth.js
+// ============================================================
+const express = require('express');
+const router = express.Router();
+const { register, login, getMe, checkUsername, getCoinHistory } = require('../controllers/authController');
+const { protect } = require('../middleware/auth');
+const { authLimiter, userCheckLimiter } = require('../middleware/rateLimiter');
+
+// Public routes
+router.post('/register', authLimiter, register);
+router.post('/login', authLimiter, login);
+router.get('/check-username', userCheckLimiter, checkUsername);
+
+// Protected routes (require login)
+router.get('/me', protect, getMe);
+router.get('/coin-history', protect, getCoinHistory);
+
+module.exports = router;
