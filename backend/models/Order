@@ -1,0 +1,110 @@
+// ============================================================
+// models/Order.js — Order schema with full tracking
+// ============================================================
+const mongoose = require('mongoose');
+const { customAlphabet } = require('nanoid');
+
+// Generate short human-readable IDs like ORD-A3K8M
+const generateOrderId = customAlphabet('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', 8);
+
+const orderSchema = new mongoose.Schema(
+  {
+    orderId: {
+      type: String,
+      unique: true,
+      default: () => 'ORD-' + generateOrderId(),
+    },
+
+    // Reference to user
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+
+    username: {
+      type: String,
+      required: true,
+    },
+
+    // The WhatsApp channel post link
+    link: {
+      type: String,
+      required: [true, 'Post link is required'],
+      trim: true,
+      validate: {
+        validator: function (v) {
+          // Accept WhatsApp channel post links only
+          return /^https?:\/\/(www\.)?whatsapp\.com\/channel\//i.test(v);
+        },
+        message: 'Only WhatsApp Channel links are accepted',
+      },
+    },
+
+    // vote or react
+    type: {
+      type: String,
+      enum: ['vote', 'react'],
+      required: true,
+    },
+
+    // For votes: A-H, for reactions: emoji character
+    option: {
+      type: String,
+      required: true,
+    },
+
+    quantity: {
+      type: Number,
+      required: true,
+      min: [30, 'Minimum quantity is 30'],
+      max: [100000, 'Maximum quantity is 100,000'],
+    },
+
+    coinsDeducted: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+
+    // Order processing status
+    status: {
+      type: String,
+      enum: ['pending', 'processing', 'completed', 'failed', 'refunded'],
+      default: 'pending',
+    },
+
+    // Admin notes
+    adminNote: {
+      type: String,
+      default: '',
+    },
+
+    // Timestamps for status changes
+    processingStartedAt: Date,
+    completedAt: Date,
+    failedAt: Date,
+
+    // IP for anti-fraud
+    ipAddress: {
+      type: String,
+      default: '',
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+// Indexes for fast queries
+orderSchema.index({ user: 1, createdAt: -1 });
+orderSchema.index({ orderId: 1 });
+orderSchema.index({ status: 1 });
+orderSchema.index({ createdAt: -1 });
+
+// Virtual: cost per unit
+orderSchema.virtual('costPerUnit').get(function () {
+  return (this.coinsDeducted / this.quantity).toFixed(4);
+});
+
+module.exports = mongoose.model('Order', orderSchema);
