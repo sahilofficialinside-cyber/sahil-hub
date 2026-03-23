@@ -1,0 +1,331 @@
+// ============================================================
+// controllers/adminController.js — Admin panel operations
+// ============================================================
+const mongoose = require('mongoose');
+const User = require('../models/User');
+const Order = require('../models/Order');
+const CoinTransaction = require('../models/CoinTransaction');
+const { asyncHandler } = require('../middleware/errorHandler');
+
+// ── GET /api/admin/dashboard ──────────────────────────────────
+const getDashboard = asyncHandler(async (req, res) => {
+  const [
+    totalUsers,
+    totalOrders,
+    completedOrders,
+    pendingOrders,
+    processingOrders,
+    coinStats,
+    recentOrders,
+    recentUsers,
+  ] = await Promise.all([
+    User.countDocuments({ isAdmin: false }),
+    Order.countDocuments(),
+    Order.countDocuments({ status: 'completed' }),
+    Order.countDocuments({ status: 'pending' }),
+    Order.countDocuments({ status: 'processing' }),
+    User.aggregate([
+      { $match: { isAdmin: false } },
+      {
+        $group: {
+          _id: null,
+          totalCoinsInSystem: { $sum: '$coins' },
+          totalCoinsSpent: { $sum: '$totalCoinsSpent' },
+          totalCoinsPurchased: { $sum: '$totalCoinsPurchased' },
+        },
+      },
+    ]),
+    Order.find()
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .select('orderId username type option quantity coinsDeducted status createdAt'),
+    User.find({ isAdmin: false })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .select('name username coins createdAt'),
+  ]);
+
+  res.json({
+    success: true,
+    dashboard: {
+      totalUsers,
+      totalOrders,
+      completedOrders,
+      pendingOrders,
+      processingOrders,
+      coinsInSystem: coinStats[0]?.totalCoinsInSystem || 0,
+      coinsSpent: coinStats[0]?.totalCoinsSpent || 0,
+      coinsPurchased: coinStats[0]?.totalCoinsPurchased || 0,
+      recentOrders,
+      recentUsers,
+    },
+  });
+});
+
+// ── GET /api/admin/users ──────────────────────────────────────
+const getUsers = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const search = req.query.search || '';
+  const skip = (page - 1) * limit;
+
+  const query = {
+    isAdmin: false,
+    ...(search && {
+      $or: [
+        { username: { $regex: search, $options: 'i' } },
+        { name: { $regex: search, $options: 'i' } },
+        { whatsapp: { $regex: search, $options: 'i' } },
+      ],
+    }),
+  };
+
+  const [users, total] = await Promise.all([
+    User.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select('-password'),
+    User.countDocuments(query),
+  ]);
+
+  // Attach order count for each user
+  const userIds = users.map((u) => u._id);
+  const orderCounts = await Order.aggregate([
+    { $match: { user: { $in: userIds } } },
+    { $group: { _id: '$user', count: { $sum: 1 } } },
+  ]);
+  const orderMap = {};
+  orderCounts.forEach((o) => (orderMap[o._id.toString()] = o.count));
+
+  const enrichedUsers = users.map((u) => ({
+    ...u.toObject(),
+    orderCount: orderMap[u._id.toString()] || 0,
+  }));
+
+  res.json({
+    success: true,
+    users: enrichedUsers,
+    pagination: { total, page, pages: Math.ceil(total / limit), limit },
+  });
+});
+
+// ── GET /api/admin/users/:id ──────────────────────────────────
+const getUserDetail = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id).select('-password');
+  if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+  const [orders, transactions] = await Promise.all([
+    Order.find({ user: user._id }).sort({ createdAt: -1 }).limit(20),
+    CoinTransaction.find({ user: user._id }).sort({ createdAt: -1 }).limit(20),
+  ]);
+
+  res.json({ success: true, user, orders, transactions });
+});
+
+// ── POST /api/admin/coins ─────────────────────────────────────
+// Add or remove coins from a user
+const manageCoins = asyncHandler(async (req, res) => {
+  const { username, amount, action, note } = req.body;
+
+  if (!username || !amount || !action) {
+    return res.status(400).json({ success: false, message: 'Username, amount, and action required.' });
+  }
+
+  const coins = parseInt(amount);
+  if (isNaN(coins) || coins < 1) {
+    return res.status(400).json({ success: false, message: 'Invalid coin amount.' });
+  }
+  if (!['add', 'remove'].includes(action)) {
+    return res.status(400).json({ success: false, message: 'Action must be "add" or "remove".' });
+  }
+
+  const user = await User.findOne({ username: username.toLowerCase() });
+  if (!user) {
+    return res.status(404).json({ success: false, message: 'User not found.' });
+  }
+
+  const oldBalance = user.coins;
+
+  if (action === 'add') {
+    user.coins += coins;
+    user.totalCoinsPurchased += coins;
+  } else {
+    if (user.coins < coins) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot remove ${coins} coins. User only has ${user.coins}.`,
+      });
+    }
+    user.coins -= coins;
+  }
+
+  await user.save();
+
+  // Record transaction
+  await CoinTransaction.create({
+    user: user._id,
+    username: user.username,
+    type: action === 'add' ? 'credit' : 'debit',
+    amount: coins,
+    balanceAfter: user.coins,
+    reason: action === 'add' ? 'admin_add' : 'admin_remove',
+    performedBy: req.user.username,
+    note: note || `Admin ${action}: ${coins} coins`,
+  });
+
+  res.json({
+    success: true,
+    message: `${action === 'add' ? 'Added' : 'Removed'} ${coins} coins ${action === 'add' ? 'to' : 'from'} @${user.username}.`,
+    previousBalance: oldBalance,
+    newBalance: user.coins,
+  });
+});
+
+// ── GET /api/admin/orders ─────────────────────────────────────
+const getOrders = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const search = req.query.search || '';
+  const status = req.query.status || '';
+  const skip = (page - 1) * limit;
+
+  const query = {
+    ...(search && {
+      $or: [
+        { orderId: { $regex: search, $options: 'i' } },
+        { username: { $regex: search, $options: 'i' } },
+      ],
+    }),
+    ...(status && { status }),
+  };
+
+  const [orders, total] = await Promise.all([
+    Order.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    Order.countDocuments(query),
+  ]);
+
+  res.json({
+    success: true,
+    orders,
+    pagination: { total, page, pages: Math.ceil(total / limit), limit },
+  });
+});
+
+// ── PATCH /api/admin/orders/:orderId/status ───────────────────
+const updateOrderStatus = asyncHandler(async (req, res) => {
+  const { status, adminNote } = req.body;
+  const validStatuses = ['pending', 'processing', 'completed', 'failed', 'refunded'];
+
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ success: false, message: 'Invalid status.' });
+  }
+
+  const order = await Order.findOne({ orderId: req.params.orderId });
+  if (!order) {
+    return res.status(404).json({ success: false, message: 'Order not found.' });
+  }
+
+  const updateData = { status, adminNote: adminNote || order.adminNote };
+  if (status === 'processing') updateData.processingStartedAt = new Date();
+  if (status === 'completed') updateData.completedAt = new Date();
+  if (status === 'failed') updateData.failedAt = new Date();
+
+  // If refunded, return coins to user
+  if (status === 'refunded' && order.status !== 'refunded') {
+    const user = await User.findById(order.user);
+    if (user) {
+      user.coins += order.coinsDeducted;
+      await user.save();
+      await CoinTransaction.create({
+        user: user._id,
+        username: user.username,
+        type: 'credit',
+        amount: order.coinsDeducted,
+        balanceAfter: user.coins,
+        reason: 'refund',
+        orderId: order.orderId,
+        performedBy: req.user.username,
+        note: `Refund for order ${order.orderId}`,
+      });
+    }
+  }
+
+  await Order.findByIdAndUpdate(order._id, updateData);
+
+  res.json({ success: true, message: `Order status updated to "${status}".` });
+});
+
+// ── PATCH /api/admin/users/:id/ban ────────────────────────────
+const toggleBan = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user || user.isAdmin) {
+    return res.status(404).json({ success: false, message: 'User not found.' });
+  }
+
+  user.isBanned = !user.isBanned;
+  await user.save();
+
+  res.json({
+    success: true,
+    message: `User @${user.username} ${user.isBanned ? 'banned' : 'unbanned'} successfully.`,
+    isBanned: user.isBanned,
+  });
+});
+
+// ── GET /api/admin/export/orders ─────────────────────────────
+// Returns CSV-formatted order data
+const exportOrders = asyncHandler(async (req, res) => {
+  const orders = await Order.find().sort({ createdAt: -1 }).limit(5000);
+
+  const headers = [
+    'Order ID', 'Username', 'Type', 'Option', 'Quantity',
+    'Coins Used', 'Status', 'IP', 'Created At',
+  ].join(',');
+
+  const rows = orders.map((o) =>
+    [
+      o.orderId, o.username, o.type, o.option, o.quantity,
+      o.coinsDeducted, o.status, o.ipAddress || '',
+      new Date(o.createdAt).toISOString(),
+    ].join(',')
+  );
+
+  const csv = [headers, ...rows].join('\n');
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename=sahil_hub_orders.csv');
+  res.send(csv);
+});
+
+// ── GET /api/admin/export/users ───────────────────────────────
+const exportUsers = asyncHandler(async (req, res) => {
+  const users = await User.find({ isAdmin: false })
+    .sort({ createdAt: -1 })
+    .select('-password')
+    .limit(5000);
+
+  const headers = [
+    'Name', 'Username', 'WhatsApp', 'Coins Balance',
+    'Total Purchased', 'Total Spent', 'Banned', 'Joined',
+  ].join(',');
+
+  const rows = users.map((u) =>
+    [
+      u.name, u.username, u.whatsapp, u.coins,
+      u.totalCoinsPurchased, u.totalCoinsSpent,
+      u.isBanned, new Date(u.createdAt).toISOString(),
+    ].join(',')
+  );
+
+  const csv = [headers, ...rows].join('\n');
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename=sahil_hub_users.csv');
+  res.send(csv);
+});
+
+module.exports = {
+  getDashboard, getUsers, getUserDetail,
+  manageCoins, getOrders, updateOrderStatus,
+  toggleBan, exportOrders, exportUsers,
+};
